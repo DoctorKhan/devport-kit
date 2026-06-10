@@ -339,12 +339,14 @@ ${_b}runctl stray kill${_r} — remove orphan dev processes for a repo
 ${_y}Usage:${_r}  runctl stray kill [dir] [--dry-run]
 
 ${_y}Description${_r}
-  Finds processes whose ${_b}cwd${_r} is this project (or a subdir other than
-  ${_d}node_modules${_r}) and whose command looks like a dev runtime (${_d}node, bun, pnpm, …${_r}),
-  then kills any PID that is ${_b}not${_r} in a live ${_d}.run/pids/*.pid${_r} tree
-  (${_d}recorded PID + ancestors + descendants via ${_c}ps${_r} / ${_c}pgrep -P${_r}).
+  Targets processes whose ${_b}cwd${_r} is this project (or a subdir other than
+  ${_d}node_modules${_r}) that either look like a dev runtime (${_d}node, bun, pnpm, …${_r}) or hold
+  a TCP listener (the same set ${_c}runctl status${_r} reports under ${_d}untracked listeners${_r}, so
+  ${_d}next-server, esbuild${_r} and other non-node names are covered too). Kills any such PID
+  ${_b}not${_r} in a live ${_d}.run/pids/*.pid${_r} tree (${_d}recorded PID + ancestors + descendants${_r}).
 
-  ${_c}--dry-run${_r} lists PIDs that would be sent ${_c}SIGTERM${_r} without killing.
+  Sends ${_c}SIGTERM${_r}, waits briefly, then ${_c}SIGKILL${_r}s any survivor.
+  ${_c}--dry-run${_r} lists the PIDs that would be signalled without killing.
 
 ${_y}See also:${_r}  ${_c}runctl stop${_r}  ${_d}(graceful stop via saved pids)${_r}  ·  ${_c}runctl reconcile${_r}
 EOF

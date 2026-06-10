@@ -1131,12 +1131,32 @@ run_pid_is_stray_dev_candidate() {
   return 1
 }
 
-# PIDs with cwd under this project (excluding node_modules) that look like dev runtimes.
-# Prefer pgrep (node-like binaries) instead of scanning every PID on the host.
+# Listener PIDs (TCP LISTEN) whose cwd is under this project, excluding node_modules.
+# This is the same set `runctl status` reports under "untracked listeners", so it
+# also catches servers whose process name isn't a known runtime (e.g. next-server,
+# esbuild, a renamed binary) that the dev-runtime scan below would miss.
+run_project_listener_pids_under_project() {
+  command -v lsof >/dev/null 2>&1 || return 0
+  local pid
+  lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null \
+    | awk 'NR>1 {print $2}' \
+    | sort -un \
+    | while IFS= read -r pid; do
+        [[ -n "$pid" ]] || continue
+        (( pid > 1 )) || continue
+        run_pid_alive "$pid" || continue
+        run_pid_cwd_under_project "$pid" || continue
+        printf '%s\n' "$pid"
+      done
+}
+
+# Candidate PIDs for `stray kill`: dev-runtime processes (node/bun/pnpm/...) whose
+# cwd is under this project, UNION any TCP listener bound under this project. The
+# caller drops PIDs in the protected .run/pids tree. Excludes node_modules.
+# Prefer pgrep (node-like binaries) over scanning every PID on the host.
 run_project_stray_candidate_pids() {
-  local seen=$'\n' pid raw
-  if command -v pgrep >/dev/null 2>&1; then
-    raw="$(
+  {
+    if command -v pgrep >/dev/null 2>&1; then
       {
         pgrep -x node 2>/dev/null || true
         pgrep -x nodejs 2>/dev/null || true
@@ -1144,60 +1164,76 @@ run_project_stray_candidate_pids() {
         pgrep -x pnpm 2>/dev/null || true
         pgrep -x npm 2>/dev/null || true
         pgrep -x yarn 2>/dev/null || true
-      } 2>/dev/null | awk 'NF' | sort -un
-    )"
-    if [[ -n "$raw" ]]; then
-      while IFS= read -r pid; do
-        [[ -z "$pid" ]] && continue
-        (( pid > 1 )) || continue
-        run_pid_is_stray_dev_candidate "$pid" || continue
-        case "$seen" in
-          *$'\n'"$pid"$'\n'*) continue ;;
-        esac
-        seen+="${pid}"$'\n'
-        printf '%s\n' "$pid"
-      done <<<"$raw"
-      return 0
+      } 2>/dev/null | awk 'NF' | sort -un \
+        | while IFS= read -r pid; do
+            (( pid > 1 )) || continue
+            run_pid_is_stray_dev_candidate "$pid" && printf '%s\n' "$pid"
+          done
+    else
+      local psout line pid
+      if psout="$(ps axo 'pid=' 2>/dev/null)" || psout="$(ps -eo 'pid=' 2>/dev/null)"; then
+        while IFS= read -r line; do
+          [[ -z "$line" ]] && continue
+          pid="$(printf '%s' "$line" | awk '{print $1+0}')"
+          (( pid > 1 )) || continue
+          run_pid_is_stray_dev_candidate "$pid" && printf '%s\n' "$pid"
+        done <<<"$psout"
+      fi
     fi
-  fi
-  local psout line
-  if ! psout="$(ps axo 'pid=' 2>/dev/null)"; then
-    psout="$(ps -eo 'pid=' 2>/dev/null)" || return 1
-  fi
-  while IFS= read -r line; do
-    [[ -z "$line" ]] && continue
-    pid="$(printf '%s' "$line" | awk '{print $1+0}')"
-    (( pid > 1 )) || continue
-    run_pid_is_stray_dev_candidate "$pid" || continue
-    case "$seen" in
-      *$'\n'"$pid"$'\n'*) continue ;;
-    esac
-    seen+="${pid}"$'\n'
-    printf '%s\n' "$pid"
-  done <<<"$psout"
+    # Union in port listeners under this project (covers non-node process names).
+    run_project_listener_pids_under_project
+  } | awk 'NF && !seen[$0]++'
 }
 
-# Kill stray dev processes for this project (not in a live .run/pids tree). RUN_STRAY_DRY_RUN=1 prints only.
+# Kill stray dev processes for this project (not in a live .run/pids tree).
+# Sends SIGTERM, waits briefly, then SIGKILLs any survivor (matches `runctl stop`).
+# RUN_STRAY_DRY_RUN=1 prints the targets without signalling.
 run_project_stray_kill() {
   local dry="${RUN_STRAY_DRY_RUN:-0}"
   local prot
   prot="$(run_project_protected_pids || true)"
-  local killed=0
+
+  local -a targets=()
   local pid
   while IFS= read -r pid; do
     [[ -n "$pid" ]] || continue
-    grep -qxF "$pid" <<<"$prot" && continue
-    if [[ "$dry" == "1" ]]; then
-      echo "run_project_stray_kill: would kill pid $pid"
-      killed=$((killed + 1))
-      continue
-    fi
-    echo "run_project_stray_kill: killing stray pid $pid"
-    kill "$pid" 2>/dev/null || true
-    killed=$((killed + 1))
+    [[ -n "$prot" ]] && grep -qxF "$pid" <<<"$prot" && continue
+    targets+=("$pid")
   done < <(run_project_stray_candidate_pids)
-  RUN_LAST_STRAY_KILL_COUNT="$killed"
+
+  RUN_LAST_STRAY_KILL_COUNT="${#targets[@]}"
   export RUN_LAST_STRAY_KILL_COUNT
+  [[ ${#targets[@]} -eq 0 ]] && return 0
+
+  if [[ "$dry" == "1" ]]; then
+    for pid in "${targets[@]}"; do
+      echo "run_project_stray_kill: would kill pid $pid ($(run_pid_program_name "$pid" 2>/dev/null || echo '?'))"
+    done
+    return 0
+  fi
+
+  for pid in "${targets[@]}"; do
+    echo "run_project_stray_kill: SIGTERM pid $pid ($(run_pid_program_name "$pid" 2>/dev/null || echo '?'))"
+    kill "$pid" 2>/dev/null || true
+  done
+
+  # Wait up to ~2s for graceful exit, then SIGKILL anything still alive.
+  local n=0 alive
+  while (( n < 20 )); do
+    alive=0
+    for pid in "${targets[@]}"; do
+      run_pid_alive "$pid" && { alive=1; break; }
+    done
+    (( alive == 0 )) && break
+    sleep 0.1
+    n=$((n + 1))
+  done
+  for pid in "${targets[@]}"; do
+    if run_pid_alive "$pid"; then
+      echo "run_project_stray_kill: SIGKILL pid $pid (ignored SIGTERM)"
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+  done
 }
 
 run_read_ports_env() {
